@@ -20,7 +20,8 @@ ENV configs /thingsboard_gateway/config
 ENV extensions /thingsboard_gateway/extensions
 ENV logs /thingsboard_gateway/logs
 RUN apt-get update && apt-get install gcc -y
-RUN pip3 install importlib_metadata --user
+RUN pip3 install --no-cache-dir importlib_metadata --user
+RUN pip3 install --no-cache-dir -r requirements.txt
 RUN python /setup.py install && mkdir -p /default-config/config /default-config/extensions/ && cp -r /thingsboard_gateway/config/* /default-config/config/ && cp -r /thingsboard_gateway/extensions/* /default-config/extensions
 VOLUME ["${configs}", "${extensions}", "${logs}"]
 CMD [ "/bin/sh", "./start-gateway.sh" ]
