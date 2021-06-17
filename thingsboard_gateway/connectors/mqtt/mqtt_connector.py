@@ -50,7 +50,7 @@ class MqttConnector(Connector, Thread):
 
         mandatory_keys = {
             "mapping": ['topicFilter', 'converter'],
-            "serverSideRpc": ['deviceNameFilter', 'methodFilter'],
+            "serverSideRpc": ['deviceNameFilter', 'methodFilter', 'requestTopicExpression', 'valueExpression'],
             "connectRequests": ['topicFilter'],
             "disconnectRequests": ['topicFilter'],
             "attributeRequests": ['topicFilter', 'topicExpression', 'valueExpression'],
@@ -323,11 +323,12 @@ class MqttConnector(Connector, Thread):
                 self.__log.info('"%s" subscription success to topic %s, subscription message id = %i',
                                 self.get_name(),
                                 self.__subscribes_sent.get(mid), mid)
-
-                if self.__subscribes_sent.get(mid) is not None:
-                    del self.__subscribes_sent[mid]
         except Exception as e:
             self.__log.exception(e)
+
+        # Success or not, remove this topic from the list of pending subscription requests
+        if self.__subscribes_sent.get(mid) is not None:
+            del self.__subscribes_sent[mid]
 
     def _on_message(self, client, userdata, message):
         self.statistics['MessagesReceived'] += 1
@@ -560,48 +561,84 @@ class MqttConnector(Connector, Thread):
             self.__log.error("Attribute updates config not found.")
 
     def server_side_rpc_handler(self, content):
+        self.__log.info("Incoming server-side RPC: %s", content)
+
+        # Check whether one of my RPC handlers can handle this request
         for rpc_config in self.__server_side_rpc:
             if search(rpc_config["deviceNameFilter"], content["device"]) \
                     and search(rpc_config["methodFilter"], content["data"]["method"]) is not None:
-                # Subscribe to RPC response topic
-                if rpc_config.get("responseTopicExpression"):
-                    topic_for_subscribe = rpc_config["responseTopicExpression"] \
+
+                # This handler seems able to handle the request
+                self.__log.info("Candidate RPC handler found")
+
+                expects_response = rpc_config.get("responseTopicExpression")
+                defines_timeout = rpc_config.get("responseTimeout")
+
+                # 2-way RPC setup
+                if expects_response and defines_timeout:
+
+                    expected_response_topic = rpc_config["responseTopicExpression"] \
                         .replace("${deviceName}", str(content["device"])) \
                         .replace("${methodName}", str(content["data"]["method"])) \
                         .replace("${requestId}", str(content["data"]["id"])) \
                         .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
-                    if rpc_config.get("responseTimeout"):
-                        timeout = time.time()*1000+rpc_config.get("responseTimeout")
-                        self.__gateway.register_rpc_request_timeout(content,
+
+                    timeout = time.time() * 1000 + rpc_config.get("responseTimeout")
+
+                    # Start listenting on the response topic
+                    self.__log.info("Subscribing to: %s", expected_response_topic)
+                    self.__subscribe(expected_response_topic,  rpc_config.get("responseTopicQoS", 1))
+
+                    # Wait for subscription to be carried out
+                    sub_response_timeout = 10
+
+                    while expected_response_topic in self.__subscribes_sent.values():
+                        sub_response_timeout -= 1
+                        time.sleep(0.1)
+                        if sub_response_timeout == 0:
+                            break
+
+                    # Ask the gateway to enqueue this as an RPC response
+                    self.__gateway.register_rpc_request_timeout(content,
                                                                     timeout,
-                                                                    topic_for_subscribe,
+                                                                    expected_response_topic,
                                                                     self.rpc_cancel_processing)
-                        # Maybe we need to wait for the command to execute successfully before publishing the request.
-                        self.__subscribe(topic_for_subscribe,  rpc_config.get("responseTopicQoS", 1))
-                    else:
-                        self.__log.error("Not found RPC response timeout in config, sending without waiting for response")
-                # Publish RPC request
-                if rpc_config.get("requestTopicExpression") is not None\
-                        and rpc_config.get("valueExpression"):
-                    topic = rpc_config.get("requestTopicExpression")\
-                        .replace("${deviceName}", str(content["device"]))\
-                        .replace("${methodName}", str(content["data"]["method"]))\
-                        .replace("${requestId}", str(content["data"]["id"]))\
-                        .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
-                    data_to_send = rpc_config.get("valueExpression")\
-                        .replace("${deviceName}", str(content["device"]))\
-                        .replace("${methodName}", str(content["data"]["method"]))\
-                        .replace("${requestId}", str(content["data"]["id"]))\
-                        .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
-                    try:
-                        self._client.publish(topic, data_to_send)
-                        self.__log.debug("Send RPC with no response request to topic: %s with data %s",
-                                         topic,
-                                         data_to_send)
-                        if rpc_config.get("responseTopicExpression") is None:
-                            self.__gateway.send_rpc_reply(device=content["device"], req_id=content["data"]["id"], success_sent=True)
-                    except Exception as e:
-                        self.__log.exception(e)
+
+                    # Wait for RPC to be successfully enqueued, which never fails.
+                    while self.__gateway.is_rpc_in_progress(expected_response_topic):
+                        time.sleep(0.1)
+
+                elif expects_response and not defines_timeout:
+                    self.__log.info("2-way RPC without timeout: treating as 1-way")
+
+                # Actually reach out for the device
+                request_topic = rpc_config.get("requestTopicExpression")\
+                    .replace("${deviceName}", str(content["device"]))\
+                    .replace("${methodName}", str(content["data"]["method"]))\
+                    .replace("${requestId}", str(content["data"]["id"]))\
+                    .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
+
+                data_to_send = rpc_config.get("valueExpression")\
+                    .replace("${deviceName}", str(content["device"]))\
+                    .replace("${methodName}", str(content["data"]["method"]))\
+                    .replace("${requestId}", str(content["data"]["id"]))\
+                    .replace("${params}", simplejson.dumps(content["data"].get("params", "")))
+
+                try:
+                    self.__log.info("Publishing to: %s with data %s", request_topic, data_to_send)
+                    self._client.publish(request_topic, data_to_send)
+
+                    if not expects_response or not defines_timeout:
+                        self.__log.info("One-way RPC: sending ack to ThingsBoard immediately")
+                        self.__gateway.send_rpc_reply(device=content["device"], req_id=content["data"]["id"], success_sent=True)
+
+                    # Everything went out smoothly: RPC is served
+                    return
+
+                except Exception as e:
+                    self.__log.exception(e)
+
+        self.__log.error("RPC not handled: %s", content)
 
     def rpc_cancel_processing(self, topic):
         log.info("RPC canceled or terminated. Unsubscribing from %s", topic)
