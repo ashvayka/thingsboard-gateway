@@ -60,10 +60,4 @@ setup(
     entry_points={
         'console_scripts': [
             'thingsboard-gateway = thingsboard_gateway.tb_gateway:daemon'
-        ]},
-    package_data={
-        "*": ["config/*"]
-    })
-
-
-
+        ]})

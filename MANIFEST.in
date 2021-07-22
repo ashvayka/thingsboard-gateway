@@ -1,0 +1,2 @@
+graft thingsboard_gateway/config
+include LICENSE
